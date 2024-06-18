@@ -14,6 +14,7 @@ from aiohttp.client import DEFAULT_TIMEOUT
 from gql import Client, gql
 from gql.transport.aiohttp import AIOHTTPTransport
 from graphql import DocumentNode
+import mimetypes
 
 AUTH_HEADER_KEY = "authorization"
 CSRF_KEY = "csrftoken"
@@ -37,6 +38,10 @@ class MonarchMoneyEndpoints(object):
     @classmethod
     def getAccountBalanceHistoryUploadEndpoint(cls) -> str:
         return cls.BASE_URL + "/account-balance-history/upload/"
+    
+    @classmethod
+    def getTransactionUploadAttachmentEndpoint(cls) -> str:
+        return "https://api.cloudinary.com/v1_1/monarch-money/image/upload/"
 
 
 class RequireMFAException(Exception):
@@ -2663,6 +2668,121 @@ class MonarchMoney(object):
             )
             if resp.status != 200:
                 raise RequestFailedException(f"HTTP Code {resp.status}: {resp.reason}")
+            
+    async def upload_transaction_attachment(
+      self, transaction_id: str, attachment_path: str
+    ) -> None:
+        """
+        Uploads a transaction attachment for a given transaction.
+
+        :param transaction_id: The transaction ID to apply the attachment to.
+        :param attachment_path: The attachment to upload.
+        """
+        if not transaction_id or not attachment_path:
+            raise RequestFailedException("transaction_id and attachment_path cannot be empty")
+      
+        filename = os.path.basename(attachment_path)
+        contents = open(attachment_path, "rb").read()
+        content_type = mimetypes.guess_type(filename)[0]
+
+        # Check file type
+        # Allow image/*, application/pdf
+        if not content_type or not any(
+            content_type.startswith(prefix) for prefix in ["image/", "application/pdf"]
+        ):
+            raise RequestFailedException("Invalid file type")
+
+        # Get transaction upload details
+        get_transaction_attachment_upload_info_query = gql(
+            """
+          mutation Common_GetTransactionAttachmentUploadInfo($transactionId: UUID!) {
+            getTransactionAttachmentUploadInfo(transactionId: $transactionId) {
+              info {
+                path
+                requestParams {
+                  timestamp
+                  folder
+                  signature
+                  api_key
+                  upload_preset
+                  __typename
+                }
+                __typename
+              }
+              __typename
+            }
+          }
+        """
+        )
+        get_transaction_attachment_upload_info_variables = {
+            "transactionId": transaction_id,
+        }
+        get_transaction_attachment_upload_info_result = await self.gql_call(
+            operation="Common_GetTransactionAttachmentUploadInfo",
+            variables=get_transaction_attachment_upload_info_variables,
+            graphql_query=get_transaction_attachment_upload_info_query,
+        )
+        get_transaction_attachment_upload_body = get_transaction_attachment_upload_info_result["getTransactionAttachmentUploadInfo"]["info"]["requestParams"]
+
+        form = FormData()
+        form.add_field("file", contents, filename=filename, content_type=content_type)
+        form.add_field("timestamp", str(get_transaction_attachment_upload_body["timestamp"]))
+        form.add_field("folder", get_transaction_attachment_upload_body["folder"])
+        form.add_field("signature", get_transaction_attachment_upload_body["signature"])
+        form.add_field("api_key", str(get_transaction_attachment_upload_body["api_key"]))
+        form.add_field("upload_preset", get_transaction_attachment_upload_body["upload_preset"])
+        
+        async with ClientSession(headers=self._headers) as session:
+            resp = await session.post(
+                MonarchMoneyEndpoints.getTransactionUploadAttachmentEndpoint(),
+                data=form,
+            )
+            if resp.status != 200:
+                raise RequestFailedException(f"HTTP Code {resp.status}: {resp.reason}")
+            # Parse the response
+            response = await resp.json()
+            
+        # Add the attachment to the transaction
+        add_transaction_attachment_query = gql(
+            """
+              mutation Common_AddTransactionAttachment($input: TransactionAddAttachmentMutationInput!) {
+                addTransactionAttachment(input: $input) {
+                  attachment {
+                    id
+                    publicId
+                    extension
+                    sizeBytes
+                    filename
+                    originalAssetUrl
+                    __typename
+                  }
+                  errors {
+                    message
+                    __typename
+                  }
+                  __typename
+                }
+              }
+            """
+        )
+        add_transaction_attachment_variables = {
+            "input": {
+                "transactionId": transaction_id,
+                "publicId": response["public_id"],
+                "filename": response["original_filename"],
+                "sizeBytes": response["bytes"],
+                "extension": response["format"],
+            },
+        }
+        add_transaction_attachment_result = await self.gql_call(
+            operation="Common_AddTransactionAttachment",
+            variables=add_transaction_attachment_variables,
+            graphql_query=add_transaction_attachment_query,
+        )
+
+        # Check if the attachment was added successfully
+        if add_transaction_attachment_result["addTransactionAttachment"]["errors"]:
+            raise RequestFailedException(add_transaction_attachment_result["addTransactionAttachment"]["errors"])
 
     async def get_recurring_transactions(
         self,
